@@ -917,6 +917,46 @@ class RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    def _save_best_checkpoint(self, val_metrics: dict):
+        """Save checkpoint if current validation metric is the best so far."""
+        if not self._save_best or not self._best_metric_key:
+            return
+        current_val = None
+        for k, v in val_metrics.items():
+            if self._best_metric_key in k:
+                current_val = float(v)
+                break
+        if current_val is None:
+            return
+        if current_val > self._best_val_metric:
+            self._best_val_metric = current_val
+            self._best_val_step = self.global_steps
+            # Save to best_checkpoint/ directory
+            import shutil
+            best_dir = os.path.join(self.config.trainer.default_local_dir, "best_checkpoint")
+            if os.path.exists(best_dir):
+                shutil.rmtree(best_dir)
+            print(f"New best val metric ({self._best_metric_key}): {current_val:.4f} at step {self.global_steps}")
+            # Temporarily swap global_steps to save under best_checkpoint name
+            saved_steps = self.global_steps
+            self.global_steps = "best"
+            # We directly save actor only (no critic/dataloader needed for best ckpt)
+            from verl.utils.fs import local_mkdir_safe
+            actor_local_path = os.path.join(best_dir, "actor")
+            self.actor_rollout_wg.save_checkpoint(actor_local_path, None, saved_steps, max_ckpt_to_keep=None)
+            local_mkdir_safe(best_dir)
+            # Write metadata
+            import json
+            meta = {"step": saved_steps, "metric_key": self._best_metric_key, "metric_value": current_val}
+            with open(os.path.join(best_dir, "best_meta.json"), "w") as f:
+                json.dump(meta, f, indent=2)
+            self.global_steps = saved_steps
+        else:
+            print(
+                f"Val metric ({self._best_metric_key}): {current_val:.4f} at step {self.global_steps} "
+                f"(best: {self._best_val_metric:.4f} at step {self._best_val_step})"
+            )
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
@@ -1238,6 +1278,12 @@ class RayPPOTrainer:
 
         self.global_steps = 0
 
+        # Best checkpoint tracking
+        self._best_val_metric = -float('inf')
+        self._best_val_step = -1
+        self._save_best = self.config.trainer.get("save_best_checkpoint", False)
+        self._best_metric_key = self.config.trainer.get("best_checkpoint_metric", None)
+
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
@@ -1540,6 +1586,8 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    # Save best checkpoint based on validation metric
+                    self._save_best_checkpoint(val_metrics)
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
