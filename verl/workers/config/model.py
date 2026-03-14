@@ -129,6 +129,12 @@ class HFModelConfig(BaseConfig):
 
     # path to pre-trained LoRA adapter to load for continued training
     lora_adapter_path: Optional[str] = None
+    # TinyLoRA config (hook-based, FSDP-compatible)
+    tinylora_rank: int = 0  # 0 = disabled
+    tinylora_num_projections: int = 13
+    tinylora_sharing: str = "global"  # "global" | "module_type" | "independent"
+    tinylora_seed: int = 42
+
     use_liger: bool = False
 
     use_fused_kernels: bool = False

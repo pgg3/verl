@@ -132,6 +132,7 @@ class FSDPEngine(BaseEngine):
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._is_lora = self.model_config.lora_rank > 0
+        self._is_tinylora = getattr(self.model_config, 'tinylora_rank', 0) > 0
 
         # QAT (Quantization-Aware Training)
         self._qat_config = getattr(self.engine_config, "qat", None)
@@ -299,6 +300,26 @@ class FSDPEngine(BaseEngine):
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
 
+        return module
+
+    def _build_tinylora_module(self, module):
+        """Apply TinyLoRA hooks + freeze base weights."""
+        from src.methods.tinylora.verl_hooks import TinyLoRAHooks
+
+        module.enable_input_require_grads()
+
+        self._tinylora = TinyLoRAHooks(
+            model=module,
+            rank=self.model_config.tinylora_rank,
+            num_projections=self.model_config.tinylora_num_projections,
+            sharing=self.model_config.tinylora_sharing,
+            seed=self.model_config.tinylora_seed,
+        )
+        # Freeze all base weights; only v vectors are trainable
+        trainable_set = {id(v) for v in self._tinylora.trainable_parameters()}
+        for p in module.parameters():
+            if id(p) not in trainable_set:
+                p.requires_grad_(False)
         return module
 
     def _build_fsdp_module(self, module):
@@ -501,6 +522,8 @@ class FSDPEngine(BaseEngine):
         # Apply LoRA adapters if low-rank adaptation is enabled
         if self._is_lora:
             module = self._build_lora_module(module)
+        elif self._is_tinylora:
+            module = self._build_tinylora_module(module)
 
         # Apply QAT before FSDP wrapping (training only)
         if self._qat_enabled and not self.engine_config.forward_only:
@@ -749,6 +772,15 @@ class FSDPEngine(BaseEngine):
                 with merged_lora_context(self.module, backup_adapters=True):
                     params = self.module.state_dict()
                     params = normalize_peft_param_name(params)
+        elif hasattr(self, '_tinylora'):
+            # Bake TinyLoRA delta into weights, get state_dict, then restore
+            self._tinylora.bake_weights_into_params()
+            params = self.module.state_dict()
+            self._tinylora.restore_weights()
+            # Filter out TinyLoRA v parameters (non-persistent _tl_* buffers
+            # don't appear in state_dict anyway)
+            params = {k: v for k, v in params.items() if not k.startswith('tinylora_v_')
+                      and 'tinylora_v_' not in k}
         else:
             params = self.module.state_dict()
 
